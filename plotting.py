@@ -8,26 +8,26 @@ from datetime import datetime
 
 # Seaborn base style without grid
 sns.set_style('white')
-sns.set_context('paper', font_scale=1.0)
+sns.set_context('paper', font_scale=1.3)
 # Matplotlib rc settings for formal academic style
 plt.rcParams.update({
     'font.family': 'serif',
     'font.serif': ['DejaVu Serif'],
     'axes.titlesize': 16,
     'axes.titlepad': 10,
-    'axes.labelsize': 14,
+    'axes.labelsize': 20,
     'axes.labelpad': 8,
-    'legend.fontsize': 12,
-    'xtick.labelsize': 12,
-    'ytick.labelsize': 12,
+    'legend.fontsize': 18,
+    'xtick.labelsize': 18,
+    'ytick.labelsize': 18,
     'xtick.major.pad': 6,
     'ytick.major.pad': 6,
     'lines.linewidth': 1.0,
     'axes.grid': False,
     'figure.subplot.left': 0.15,
     'figure.subplot.right': 0.95,
-    'figure.subplot.bottom': 0.15,
-    'figure.subplot.top': 0.88,
+    'figure.subplot.bottom': 0.20,
+    'figure.subplot.top': 0.95,
     'text.usetex': False
 })
 
@@ -35,9 +35,9 @@ plt.rcParams.update({
 formal_name = {
     'graph': 'GNN',
     'dqn': 'DQN',
-    'hillclimb': 'k-step lookahead',
+    'hillclimb': '1-step lookahead',
     'whittle': 'Whittle',
-    'none': 'None',
+    'none': 'No intervention',
     'tabular': 'Tabular'
 }
 # Fixed, distinctive colors for each algorithm
@@ -134,7 +134,6 @@ def plot_trials(
     for m in hist_metrics:
         # History
         fig, ax = plt.subplots(figsize=(width, height))
-        fig.subplots_adjust(left=0.15, right=0.95, bottom=0.15, top=0.88)
         finals = []
         for a in hist_algos:
             col = f"{a}_{m}_mean"
@@ -172,7 +171,6 @@ def plot_trials(
 
         # Cumulative
         fig, ax = plt.subplots(figsize=(width, height))
-        fig.subplots_adjust(left=0.15, right=0.95, bottom=0.15, top=0.88)
         finals = []
         for a in hist_algos:
             col = f"{a}_{m}_mean"
@@ -210,10 +208,10 @@ def plot_trials(
 
 
 def aggregate_history(
-    output_dir="results",
+    output_dir="real_data_trials/results",
     plot_cumulative_for=("reward",),
     file_prefix="comparison",
-    textwidth_inches=7.0,
+    textwidth_inches=10.0,
     auto_scale=False
 ):
     """
@@ -241,7 +239,6 @@ def aggregate_history(
     width, height = textwidth_inches, 7 * 0.6
     for m in hist_metrics:
         fig, ax = plt.subplots(figsize=(width, height))
-        fig.subplots_adjust(left=0.15, right=0.95, bottom=0.15, top=0.88)
         finals=[]
         for a in hist_algos:
             col=f"{a}_{m}_mean"
@@ -271,13 +268,14 @@ def aggregate_history(
         ax.set_xlabel("Timestep")
         ax.set_ylabel(m.replace('_',' ').title())
         style_ax(ax)
-        ax.legend(frameon=False)
+        ax.legend(frameon=False,     
+            loc='upper right',
+            bbox_to_anchor=(0.97, 0.84) )
         fig.savefig(os.path.join(output_dir, f"{file_prefix}_{m}_history_mean_std.pdf"), format='pdf', dpi=300)
         plt.close(fig)
 
         # cumulative
         fig, ax = plt.subplots(figsize=(width, height))
-        fig.subplots_adjust(left=0.15, right=0.95, bottom=0.15, top=0.88)
         finals=[]
         for a in hist_algos:
             col=f"{a}_{m}_mean"
@@ -309,9 +307,11 @@ def aggregate_history(
         ax.set_xlabel("Timestep")
         ax.set_ylabel(f"Cumulative {m.replace('_',' ').title()}")
         style_ax(ax)
-        ax.legend(frameon=False)
+        ax.legend(frameon=False,
+            loc='upper right',
+            bbox_to_anchor=(0.95, 0.92))
         fig.savefig(os.path.join(output_dir, f"{file_prefix}_{m}_history_cumulative.pdf"), format='pdf', dpi=300)
         plt.close(fig)
 
 if __name__ == '__main__':
-    aggregate_history()
+    aggregate_history(auto_scale=True)

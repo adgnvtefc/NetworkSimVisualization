@@ -22,15 +22,103 @@ writer = SummaryWriter(log_path)
 writer.add_text("Experiment Info", "DQN training with custom environment")
 logger = TensorboardLogger(writer)
 
-# Define the neural network
-class QNet(nn.Module):
+class _NonNegLinear(nn.Module):
+    """
+    Linear layer with nonnegative weights and biases via softplus parameterization.
+    Ensures monotonicity needed in DSF construction.
+    """
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # Unconstrained parameters
+        self.weight_param = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight_param)
+        if bias:
+            self.bias_param = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter('bias_param', None)
+
+        self.softplus = nn.Softplus()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.softplus(self.weight_param)
+        if self.bias_param is not None:
+            bias = self.softplus(self.bias_param)
+            return x @ weight.t() + bias
+        return x @ weight.t()
+
+
+class DSFQNet(nn.Module):
+    """
+    Deep Submodular Q Network (DSF) that is submodular and monotone in the action set A
+    for any fixed state s. It follows the DSF design: nonnegative linear mixing between
+    layers and concave, nondecreasing activations.
+
+    Q(s, A) = w_out^T phi_L( ... phi_1( A ⊙ g(s) @ W1 + b1 ) @ W2 + b2 ... ) + b_out
+
+    - We enforce Wk >= 0 and bk >= 0 via softplus.
+    - phi_k(x) = 1 - exp(-x) which is concave and nondecreasing on x >= 0.
+    - g(s) >= 0 is a state-dependent nonnegative gating over items (constant given s),
+      so Q is submodular in A for each fixed s per DSF theory.
+    """
+    def __init__(self, state_dim: int, action_dim: int, hidden_sizes=(128, 128), dropout_p: float = 0.1):
+        super().__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+
+        # State-dependent nonnegative gating that produces per-item weights
+        self.gate = _NonNegLinear(state_dim, action_dim)
+
+        # DSF hidden layers operating on the (gated) action vector
+        in_dim = action_dim
+        layers = []
+        alpha_params = []
+        for h in hidden_sizes:
+            layers.append(_NonNegLinear(in_dim, h))
+            # Learnable positive alpha for activation scaling per layer
+            alpha_param = nn.Parameter(torch.tensor(1.0))
+            alpha_params.append(alpha_param)
+            in_dim = h
+        self.layers = nn.ModuleList(layers)
+        self.alpha_params = nn.ParameterList(alpha_params)
+        self.dropout = nn.Dropout(p=dropout_p) if dropout_p and dropout_p > 0 else nn.Identity()
+
+        # Nonnegative readout to scalar
+        self.readout = _NonNegLinear(in_dim, 1)
+
+    @staticmethod
+    def concave_activation_scaled(x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+        # Ensure nonnegativity before applying; inputs should already be >= 0
+        x = torch.relu(x)
+        alpha_pos = torch.nn.functional.softplus(alpha) + 1e-6
+        return (1.0 - torch.exp(-alpha_pos * x)) / alpha_pos
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor, state_shape=None, action_shape=None) -> torch.Tensor:
+        # State-dependent per-item weights g(s) >= 0
+        g = self.gate(state)  # [B, action_dim], nonnegative
+        # Mask actions by state if desired: avoid credit for already active nodes
+        # a_tilde remains in [0, inf) and is linear in action
+        a_tilde = action * g
+
+        h = a_tilde
+        for lin, alpha in zip(self.layers, self.alpha_params):
+            z = lin(h)
+            h = self.concave_activation_scaled(z, alpha)
+            h = self.dropout(h)
+
+        q = self.readout(h)  # [B, 1]
+        return q
+
+
+class QNetBaseline(nn.Module):
     def __init__(self, state_dim, action_dim):
-        super(QNet, self).__init__()
+        super(QNetBaseline, self).__init__()
         self.fc1 = nn.Linear(state_dim + action_dim, 128)
         self.fc2 = nn.Linear(128, 128)
         self.fc3 = nn.Linear(128, 128)
         self.fc4 = nn.Linear(128, 128)
-        self.fc5 = nn.Linear(128, 1)  # Output is a scalar Q-value
+        self.fc5 = nn.Linear(128, 1)
 
     def forward(self, state, action, state_shape=None, action_shape=None):
         x = torch.cat([state, action], dim=1)
@@ -43,7 +131,7 @@ class QNet(nn.Module):
 
 # Define the custom policy
 class CustomQPolicy(BasePolicy):
-    def __init__(self, model, optim, action_dim, k=5, gamma=0.95, epsilon=1.0):
+    def __init__(self, model, optim, action_dim, k=5, gamma=0.95, epsilon=1.0, target_model: nn.Module = None, tau: float = 0.005):
         super().__init__(action_space=gym.spaces.MultiBinary(action_dim))
         self.model = model
         self.optim = optim
@@ -51,6 +139,12 @@ class CustomQPolicy(BasePolicy):
         self.action_dim = action_dim
         self._gamma = gamma
         self.epsilon = epsilon  # Epsilon for epsilon-greedy exploration
+        self.target_model = target_model
+        if self.target_model is None:
+            # If no target provided, mirror the current model
+            import copy
+            self.target_model = copy.deepcopy(self.model)
+        self._tau = tau
 
     def forward(self, batch, state=None):
         obs = batch.obs  # Shape: [batch_size, state_dim]
@@ -67,45 +161,42 @@ class CustomQPolicy(BasePolicy):
         act = torch.zeros(batch_size, self.action_dim, device=device)
 
         for i in range(batch_size):
-            state_i = obs[i].clone()  # Current state for the ith sample
+            base_state = obs[i].clone()
             selected_node_indices = []
 
+            # Build the action set greedily by evaluating multi-hot sets
             for _ in range(self.k):
-                # Identify available nodes (not active and not already selected)
-                available_indices = (state_i == 0).nonzero(as_tuple=False).squeeze().tolist()
+                # Available: nodes not active in state and not already selected
+                all_available = (base_state == 0).nonzero(as_tuple=False).squeeze().tolist()
+                if isinstance(all_available, int):
+                    all_available = [all_available]
+                # Exclude already-selected indices this step
+                available_indices = [idx for idx in all_available if idx not in selected_node_indices]
                 if not available_indices:
-                    break  # No more available nodes to select
-                if type(available_indices) == int:
-                    available_indices = [available_indices]
+                    break
 
-                # Generate actions for available nodes
-                actions_list = []
+                # Form candidate action sets: current selected ∪ {idx}
+                candidates = []
                 for idx in available_indices:
-                    action = torch.zeros(self.action_dim, device=device)
-                    action[idx] = 1
-                    actions_list.append(action)
-                actions_tensor = torch.stack(actions_list)  # Shape: [num_available, action_dim]
-                states_tensor = state_i.unsqueeze(0).repeat(len(available_indices), 1)  # Shape: [num_available, state_dim]
+                    action_vec = torch.zeros(self.action_dim, device=device)
+                    if selected_node_indices:
+                        action_vec[selected_node_indices] = 1
+                    action_vec[idx] = 1
+                    candidates.append(action_vec)
+                actions_tensor = torch.stack(candidates)
+                states_tensor = base_state.unsqueeze(0).repeat(len(available_indices), 1)
 
-                # Compute Q-values
                 with torch.no_grad():
-                    q_values = self.model(states_tensor, actions_tensor).squeeze()  # Shape: [num_available]
+                    q_values = self.model(states_tensor, actions_tensor).squeeze()
 
-                # Apply epsilon-greedy
                 if random.random() < self.epsilon:
-                    # Exploration: Randomly select an available action
                     selected_idx = random.choice(range(len(available_indices)))
                 else:
-                    # Exploitation: Select the action with highest Q-value
                     selected_idx = torch.argmax(q_values).item()
 
                 selected_node = available_indices[selected_idx]
                 selected_node_indices.append(selected_node)
 
-                # Update state to reflect that the selected node is now active
-                state_i[selected_node] = 1
-
-            # Set the selected actions in the action tensor
             act[i, selected_node_indices] = 1
 
         return Batch(act=act)
@@ -144,7 +235,7 @@ class CustomQPolicy(BasePolicy):
 
         q_values = self.model(states, actions).squeeze()
 
-        # Compute target Q-values
+        # Compute target Q-values using Double DQN
         with torch.no_grad():
             next_q_values = []
             for i in range(next_states.shape[0]):
@@ -153,7 +244,7 @@ class CustomQPolicy(BasePolicy):
                 if not available_indices:
                     max_q_value = 0.0
                 else:
-                    if type(available_indices) == int:
+                    if isinstance(available_indices, int):
                         available_indices = [available_indices]
 
                     actions_list = []
@@ -163,14 +254,26 @@ class CustomQPolicy(BasePolicy):
                         actions_list.append(action)
                     actions_tensor = torch.stack(actions_list)
                     states_tensor = next_state.unsqueeze(0).repeat(len(available_indices), 1)
-                    q_vals = self.model(states_tensor, actions_tensor).squeeze()
-                    max_q_value = q_vals.max().item()
+
+                    # Main network selects argmax
+                    q_vals_main = self.model(states_tensor, actions_tensor).squeeze()
+                    best_idx = torch.argmax(q_vals_main).item()
+                    best_action = actions_tensor[best_idx].unsqueeze(0)
+                    best_state = states_tensor[best_idx].unsqueeze(0)
+                    # Target network evaluates
+                    max_q_value = self.target_model(best_state, best_action).item()
                 next_q_values.append(max_q_value)
             next_q_values = torch.tensor(next_q_values, device=states.device)
 
             target_q_values = rewards + gamma * (1 - dones) * next_q_values
 
-        loss = nn.functional.mse_loss(q_values, target_q_values)
+        loss = nn.functional.smooth_l1_loss(q_values, target_q_values)
+
+        # Soft-update target network
+        with torch.no_grad():
+            for param, target_param in zip(self.model.parameters(), self.target_model.parameters()):
+                target_param.data.mul_(1.0 - self._tau)
+                target_param.data.add_(self._tau * param.data)
         return loss
 
 @dataclass
@@ -223,9 +326,15 @@ def train_dqn_agent(config, num_actions, num_epochs=3):
     state_dim = config['num_nodes']
     action_dim = config['num_nodes']
 
-    model = QNet(state_dim, action_dim)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
-    policy = CustomQPolicy(model, optimizer, action_dim=action_dim, k=num_actions, gamma=0.99)
+    use_dsf = config.get('use_dsf', True)
+    if use_dsf:
+        model = DSFQNet(state_dim, action_dim)
+    else:
+        model = QNetBaseline(state_dim, action_dim)
+    target_model = type(model)(state_dim, action_dim)
+    target_model.load_state_dict(model.state_dict())
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-5)
+    policy = CustomQPolicy(model, optimizer, action_dim=action_dim, k=num_actions, gamma=0.99, target_model=target_model, tau=0.005)
 
     # Set up collectors
     train_collector = Collector(policy, train_envs, VectorReplayBuffer(total_size=20000 * train_envs.env_num, buffer_num=train_envs.env_num))
@@ -237,7 +346,7 @@ def train_dqn_agent(config, num_actions, num_epochs=3):
         train_collector=train_collector,
         test_collector=None,
         max_epoch=num_epochs,
-        step_per_epoch=1000,
+        step_per_epoch=3000,
         step_per_collect=50,
         episode_per_test=0,
         batch_size=64,
@@ -278,33 +387,38 @@ def select_action_dqn(graph, model, num_actions):
     device = next(model.parameters()).device
     selected_node_indices = []
 
+    # Greedy selection on multi-hot action sets evaluated by the DSF model
+    base_state = state.copy()
     for _ in range(num_actions):
-        # Prepare the state tensor
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+        state_tensor = torch.as_tensor(base_state, dtype=torch.float32, device=device).unsqueeze(0)
 
-        # Generate all possible actions (one-hot encoded)
-        actions = torch.eye(num_nodes, device=device)
-        states = state_tensor.repeat(num_nodes, 1)
-        actions_tensor = actions
+        # Build candidate sets by adding each feasible node to current selection
+        candidates = []
+        candidate_indices = []
+        active_nodes_indices = [i for i, node in enumerate(graph.nodes()) if graph.nodes[node]['obj'].isActive()]
+        forbidden = set(active_nodes_indices) | set(selected_node_indices)
+        for idx in range(num_nodes):
+            if idx in forbidden:
+                continue
+            action_vec = torch.zeros(num_nodes, device=device)
+            if selected_node_indices:
+                action_vec[selected_node_indices] = 1
+            action_vec[idx] = 1
+            candidates.append(action_vec)
+            candidate_indices.append(idx)
 
-        # Compute Q-values
+        if not candidates:
+            break
+
+        actions_tensor = torch.stack(candidates)
+        states = state_tensor.repeat(actions_tensor.size(0), 1)
+
         with torch.no_grad():
             q_values = model(states, actions_tensor).squeeze()
 
-        # Mask already active nodes and previously selected actions
-        active_nodes_indices = [i for i, node in enumerate(graph.nodes()) if graph.nodes[node]['obj'].isActive()]
-        already_selected_indices = [node for node in selected_node_indices]
-        mask_indices = active_nodes_indices + already_selected_indices
-
-        q_values_np = q_values.cpu().numpy()
-        q_values_np[mask_indices] = -np.inf  # Assign negative infinity to already active or selected nodes
-
-        # Select the top action
-        top_action_index = np.argmax(q_values_np)
+        top_local = torch.argmax(q_values).item()
+        top_action_index = candidate_indices[top_local]
         selected_node_indices.append(top_action_index)
-
-        # Update the state to assume the selected action is now active
-        state[top_action_index] = 1
     
     seeded_nodes = [graph.nodes[node_index]['obj'] for node_index in selected_node_indices]
     end_time = time.perf_counter()

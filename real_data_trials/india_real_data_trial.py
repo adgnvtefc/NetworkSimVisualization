@@ -15,6 +15,7 @@ print()
 
 import os, sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 import networkx as nx
 from networkSim import NetworkSim as ns
@@ -22,21 +23,29 @@ from networkvis import NetworkVis as nv
 from comparisons import Comparisons 
 from plotting import plot_trials
 
-graph = ns.build_graph_from_edgelist("graphs/India.txt", value_low=1, value_high=2)
+graph_path = os.path.join(ROOT, "graphs", "India.txt")
+graph = ns.build_graph_from_edgelist(graph_path, value_low=1, value_high=2)
 pos = nx.spring_layout(graph)
 
-algorithms = ['graph', 'dqn', 'hillclimb','whittle','none']
-NUM_ACTIONS = 30
+# Reversible toggle: set to False to re-enable GNN/graph algorithm
+TEST_DISABLE_GNN = True
+
+if TEST_DISABLE_GNN:
+    algorithms = ['dqn', 'whittle', 'none']
+else:
+    algorithms = ['graph', 'dqn', 'hillclimb','whittle','none']
+NUM_ACTIONS = 20
 NUM_COMPARISONS = 50
-CASCADE_PROB = 0.03
+CASCADE_PROB = 0.075
 GAMMA = 0.95
 TIMESTEPS = 30
 TIMESTEP_INTERVAL = 5
 
 comp = Comparisons(device=device)  
-print("start graph")
-comp.train_graph(graph, NUM_ACTIONS, CASCADE_PROB, GAMMA)
-print("Finished train_graph")
+if not TEST_DISABLE_GNN:
+    print("start graph")
+    comp.train_graph(graph, NUM_ACTIONS, CASCADE_PROB, GAMMA)
+    print("Finished train_graph")
 comp.train_whittle(graph, GAMMA)
 print("Finished train_whittle")
 comp.train_dqn(graph, NUM_ACTIONS, CASCADE_PROB)

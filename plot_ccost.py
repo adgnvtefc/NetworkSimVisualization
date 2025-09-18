@@ -5,25 +5,25 @@ from datetime import datetime
 
 # Seaborn and matplotlib style
 sns.set_style('white')
-sns.set_context('paper', font_scale=1.0)
+sns.set_context('paper', font_scale=1)
 plt.rcParams.update({
     'font.family': 'serif',
     'font.serif': ['DejaVu Serif'],
     'axes.titlesize': 16,
     'axes.titlepad': 10,
-    'axes.labelsize': 14,
+    'axes.labelsize': 20,
     'axes.labelpad': 8,
-    'legend.fontsize': 12,
-    'xtick.labelsize': 12,
-    'ytick.labelsize': 12,
+    'legend.fontsize': 18,
+    'xtick.labelsize': 18,
+    'ytick.labelsize': 18,
     'xtick.major.pad': 6,
     'ytick.major.pad': 6,
     'lines.linewidth': 1.0,
     'axes.grid': False,
     'figure.subplot.left': 0.15,
     'figure.subplot.right': 0.95,
-    'figure.subplot.bottom': 0.15,
-    'figure.subplot.top': 0.88,
+    'figure.subplot.bottom': 0.20,
+    'figure.subplot.top': 0.95,
     'text.usetex': False
 })
 
@@ -78,7 +78,6 @@ def plot_compute_cost(
     # Prepare figure
     width, height = textwidth_inches, textwidth_inches * 0.6
     fig, ax = plt.subplots(figsize=(width, height))
-    fig.subplots_adjust(left=0.15, right=0.95, bottom=0.15, top=0.88)
 
     # Helper to style axes
     def style_ax(ax):
